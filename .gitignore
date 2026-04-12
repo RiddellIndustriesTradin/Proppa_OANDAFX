@@ -1,0 +1,38 @@
+# Environment
+.env
+.env.local
+venv/
+env/
+
+# Logs
+*.log
+/tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+
+# API Keys / Secrets
+*.pem
+*.key
+secrets.json
