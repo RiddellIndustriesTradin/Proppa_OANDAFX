@@ -144,7 +144,29 @@ def get_account_info() -> dict:
     endpoint = f"/v3/accounts/{OANDA_ACCOUNT_ID}"
     return oanda_request("GET", endpoint)
 
-def place_order(side: str, units: int, sl_pips: float, tp_pips: float) -> dict:
+def calculate_position_size(account_balance: float, risk_percent: float, sl_pips: float) -> int:
+    """
+    Calculate position size based on 1% risk rule
+    Formula: Units = (Account Balance * Risk%) / (SL pips * 100 * Pip Value)
+    For EUR/USD: 1 pip on 0.01 lot = $0.10 AUD
+    """
+    try:
+        risk_amount = account_balance * risk_percent  # 1% of balance
+        pip_value_per_microlot = 0.10  # $0.10 per pip per 0.01 lot
+        
+        # Calculate how many micro lots needed for the risk amount
+        units_needed = risk_amount / (sl_pips * pip_value_per_microlot)
+        
+        # Convert to standard lot units (0.01 increments)
+        units = max(int(units_needed * 100) / 100, 0.01)  # Minimum 0.01
+        
+        logger.info(f"Position sizing: Balance=${account_balance:.2f} | Risk=${risk_amount:.2f} | SL={sl_pips}p | Units={units:.2f}")
+        return int(units * 100000)  # Convert to OANDA units
+    except Exception as e:
+        logger.error(f"Position sizing error: {e}")
+        return int(LOT_SIZE * 100000)  # Fallback to fixed lot
+
+def place_order(side: str, sl_pips: float, tp_pips: float) -> dict:
     """Place market order with stop loss and take profit"""
     endpoint = f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
     
@@ -157,6 +179,13 @@ def place_order(side: str, units: int, sl_pips: float, tp_pips: float) -> dict:
     bid = float(ticker.get("bids", [{}])[0].get("price", 0))
     ask = float(ticker.get("asks", [{}])[0].get("price", 0))
     current_price = (bid + ask) / 2
+    
+    # Get account balance for position sizing
+    account_info = get_account_info()
+    account_balance = float(account_info.get("account", {}).get("balance", 1000))
+    
+    # Calculate position size based on 1% risk
+    units = calculate_position_size(account_balance, RISK_PERCENT, sl_pips)
     
     # Calculate TP and SL levels
     if side == "BUY":
@@ -185,7 +214,7 @@ def place_order(side: str, units: int, sl_pips: float, tp_pips: float) -> dict:
     
     if "orderFillTransaction" in response:
         logger.info(f"Order placed: {response['orderFillTransaction']}")
-        send_telegram_alert(f"🔥 **ENTRY SIGNAL**\n{side} EUR/USD\nPrice: {current_price:.5f}\nUnits: {units}\nSL: {sl_pips}p | TP: {tp_pips}p")
+        send_telegram_alert(f"🔥 **ENTRY SIGNAL**\n{side} EUR/USD\nPrice: {current_price:.5f}\nUnits: {units/100000:.2f} lots\nSL: {sl_pips}p | TP: {tp_pips}p")
         return response
     else:
         logger.error(f"Order failed: {response}")
@@ -393,9 +422,8 @@ def main():
             if signal_triggered:
                 logger.info(f"✅ Entry signal: {direction} | SL: {sl_pips}p | TP: {tp_pips}p")
                 
-                # Place order
-                units = int(LOT_SIZE * 100000)
-                order_result = place_order(direction, units, sl_pips, tp_pips)
+                # Place order (position size calculated dynamically inside place_order)
+                order_result = place_order(direction, sl_pips, tp_pips)
                 
                 if "orderFillTransaction" in order_result:
                     trade_logged_today = True
