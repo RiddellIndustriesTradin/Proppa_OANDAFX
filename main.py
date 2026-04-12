@@ -16,9 +16,9 @@ from requests.auth import HTTPBasicAuth
 import telegram
 
 # ===== CONFIGURATION =====
-OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com")
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "101-011-39004310-001")
-OANDA_TOKEN = os.getenv("OANDA_TOKEN")
+OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "101-011-39004310-001").strip()
+OANDA_TOKEN = os.getenv("OANDA_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "8075862544"))
 
