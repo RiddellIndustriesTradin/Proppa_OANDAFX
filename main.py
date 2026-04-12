@@ -56,18 +56,32 @@ logger = logging.getLogger(__name__)
 
 # ===== TELEGRAM =====
 def send_telegram_alert(message: str):
-    """Send alert to Telegram"""
+    """Send alert to Telegram (non-blocking)"""
     try:
         if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
             logger.warning("Telegram not configured, skipping alert")
             return
         
-        bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-        bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=message,
-            parse_mode=telegram.constants.ParseMode.MARKDOWN
-        )
+        import asyncio
+        async def send_async():
+            bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=message,
+                parse_mode=telegram.constants.ParseMode.MARKDOWN
+            )
+        
+        # Run async function without event loop warnings
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        loop.run_until_complete(send_async())
         logger.info(f"Telegram alert sent: {message[:50]}...")
     except Exception as e:
         logger.error(f"Telegram error: {e}")
