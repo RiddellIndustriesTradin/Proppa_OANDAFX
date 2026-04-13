@@ -324,10 +324,14 @@ def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
     
     now = datetime.now(timezone.utc)
     
-    # Check time window
+    # Check time window (07:30-09:00 GMT)
     hour, minute = now.hour, now.minute
-    if not (ENTRY_START_HOUR == hour and ENTRY_START_MIN <= minute < 60) and \
-       not (ENTRY_END_HOUR == hour and 0 <= minute < ENTRY_END_MIN):
+    in_window = (
+        (ENTRY_START_HOUR == hour and ENTRY_START_MIN <= minute < 60) or  # 07:30-07:59
+        (ENTRY_START_HOUR < hour < ENTRY_END_HOUR) or  # 08:00-08:59
+        (ENTRY_END_HOUR == hour and 0 <= minute < ENTRY_END_MIN)  # 09:00-09:00 (just 09:00 exactly)
+    )
+    if not in_window:
         return False, "", 0, 0
     
     # Get latest candles
@@ -384,8 +388,9 @@ def is_in_orb_window(candle: dict) -> bool:
         time_str = candle.get("time", "")
         candle_time = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
         
+        # Only hour 7, minutes 0-29 (ORB is 07:00-07:30)
         return (candle_time.hour == ORB_START_HOUR and 
-                ORB_START_MIN <= candle_time.minute < ORB_END_HOUR*60 + ORB_END_MIN)
+                ORB_START_MIN <= candle_time.minute < ORB_END_MIN)
     except:
         return False
 
