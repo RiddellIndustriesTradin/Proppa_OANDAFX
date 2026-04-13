@@ -54,6 +54,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress noisy library logging
+logging.getLogger('telegram').setLevel(logging.WARNING)
+logging.getLogger('telegram.vendor.ptb_urllib3.urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+
 # ===== TELEGRAM =====
 def send_telegram_alert(message: str):
     """Send alert to Telegram (non-blocking)"""
