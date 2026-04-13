@@ -45,7 +45,7 @@ COMMISSION_PIPS = 1.5
 
 # ===== LOGGING =====
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Changed to DEBUG to see all filter rejections
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('/tmp/eur_usd_bot.log'),
@@ -326,6 +326,7 @@ def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
     Returns: (signal_triggered, direction, stop_loss_pips, take_profit_pips)
     """
     if len(candles) < 50:
+        logger.debug(f"⚠️ Not enough candles: {len(candles)}/50")
         return False, "", 0, 0
     
     now = datetime.now(timezone.utc)
@@ -338,6 +339,7 @@ def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
         (ENTRY_END_HOUR == hour and 0 <= minute < ENTRY_END_MIN)  # 09:00-09:00 (just 09:00 exactly)
     )
     if not in_window:
+        logger.debug(f"⚠️ Outside entry window: {hour:02d}:{minute:02d} GMT")
         return False, "", 0, 0
     
     # Get latest candles
@@ -350,12 +352,18 @@ def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
     close_prev = float(prev["mid"]["c"])
     
     # Calculate ORB (opening range break)
-    orb_high = max([float(c["mid"]["h"]) for c in candles if is_in_orb_window(c)])
-    orb_low = min([float(c["mid"]["l"]) for c in candles if is_in_orb_window(c)])
+    orb_candles = [c for c in candles if is_in_orb_window(c)]
+    if not orb_candles:
+        logger.debug("⚠️ No candles in ORB window (07:00-07:30)")
+        return False, "", 0, 0
+    
+    orb_high = max([float(c["mid"]["h"]) for c in orb_candles])
+    orb_low = min([float(c["mid"]["l"]) for c in orb_candles])
     orb_range = (orb_high - orb_low) * 10000  # Convert to pips
     
     # Check ORB range validity
     if not (ORB_MIN <= orb_range <= ORB_MAX):
+        logger.debug(f"⚠️ ORB range {orb_range:.2f}p outside bounds ({ORB_MIN}-{ORB_MAX}p)")
         return False, "", 0, 0
     
     # Calculate indicators
@@ -365,27 +373,35 @@ def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
     
     # Validate SL bounds
     if not (SL_MIN <= sl_pips <= SL_MAX):
+        logger.debug(f"⚠️ SL {sl_pips:.2f}p outside bounds ({SL_MIN}-{SL_MAX}p)")
         return False, "", 0, 0
     
     # Volume filter
     vol_sma = calculate_volume_sma(candles, VOLUME_SMA_PERIOD)
     current_volume = candles[-1].get("volume", 0)
     if current_volume < vol_sma * VOLUME_FILTER_MULTIPLIER:
+        logger.debug(f"⚠️ Volume {current_volume} < threshold {vol_sma * VOLUME_FILTER_MULTIPLIER:.0f}")
         return False, "", 0, 0
     
     # EMA filter
     ema = calculate_ema(candles, EMA_PERIOD)
     
+    # Log signal check attempt (verbose)
+    logger.info(f"📊 Signal check: Close={close_latest:.5f}, ORB_High={orb_high:.5f}, ORB_Low={orb_low:.5f}, EMA={ema:.5f}, ATR={atr_pips:.2f}p")
+    
     # Entry signal: close breaks above ORB high + close > EMA
     if close_latest > (orb_high + 0.0001) and close_latest > ema:
         tp_pips = sl_pips * 1.5  # 1.5:1 risk-reward
+        logger.info(f"🎯 **BUY SIGNAL DETECTED** | SL: {sl_pips:.2f}p | TP: {tp_pips:.2f}p")
         return True, "BUY", sl_pips, tp_pips
     
     # Short signal: close breaks below ORB low + close < EMA
     if close_latest < (orb_low - 0.0001) and close_latest < ema:
         tp_pips = sl_pips * 1.5
+        logger.info(f"🎯 **SELL SIGNAL DETECTED** | SL: {sl_pips:.2f}p | TP: {tp_pips:.2f}p")
         return True, "SELL", sl_pips, tp_pips
     
+    logger.debug(f"⚠️ No breakout: Close above ORB? {close_latest > orb_high + 0.0001}, Close > EMA? {close_latest > ema}")
     return False, "", 0, 0
 
 def is_in_orb_window(candle: dict) -> bool:
