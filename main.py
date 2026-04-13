@@ -45,7 +45,7 @@ COMMISSION_PIPS = 1.5
 
 # ===== LOGGING =====
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG to see all filter rejections
+    level=logging.INFO,  # INFO level for Railway visibility
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('/tmp/eur_usd_bot.log'),
@@ -333,7 +333,6 @@ def check_entry_signal(candles: List[dict], sl_warning_flag: dict) -> Tuple[bool
     sl_warning_flag: dict with 'logged' boolean to track if SL warning was logged today
     """
     if len(candles) < 50:
-        logger.debug(f"⚠️ Not enough candles: {len(candles)}/50")
         return False, "", 0, 0
     
     now = datetime.now(timezone.utc)
@@ -346,7 +345,6 @@ def check_entry_signal(candles: List[dict], sl_warning_flag: dict) -> Tuple[bool
         (ENTRY_END_HOUR == hour and 0 <= minute < ENTRY_END_MIN)  # 09:00-09:00 (just 09:00 exactly)
     )
     if not in_window:
-        logger.debug(f"⚠️ Outside entry window: {hour:02d}:{minute:02d} GMT")
         return False, "", 0, 0
     
     # Get latest candles
@@ -361,13 +359,12 @@ def check_entry_signal(candles: List[dict], sl_warning_flag: dict) -> Tuple[bool
     # Calculate ORB (opening range break)
     orb_candles = [c for c in candles if is_in_orb_window(c)]
     if not orb_candles:
-        logger.debug("⚠️ No candles in ORB window (07:00-07:30)")
         return False, "", 0, 0
     
-    # Debug: Log ORB candle count and time range
+    # Log ORB candle count and time range
     first_orb_time = orb_candles[0].get("time", "unknown")
     last_orb_time = orb_candles[-1].get("time", "unknown")
-    logger.debug(f"📊 ORB candles: {len(orb_candles)} (from {first_orb_time} to {last_orb_time})")
+    logger.info(f"📊 ORB candles: {len(orb_candles)} (from {first_orb_time} to {last_orb_time})")
     
     orb_high = max([float(c["mid"]["h"]) for c in orb_candles])
     orb_low = min([float(c["mid"]["l"]) for c in orb_candles])
@@ -375,7 +372,7 @@ def check_entry_signal(candles: List[dict], sl_warning_flag: dict) -> Tuple[bool
     
     # Check ORB range validity
     if not (ORB_MIN <= orb_range <= ORB_MAX):
-        logger.debug(f"⚠️ ORB range {orb_range:.2f}p outside bounds ({ORB_MIN}-{ORB_MAX}p) | High: {orb_high:.5f}, Low: {orb_low:.5f}")
+        logger.info(f"⚠️ ORB range {orb_range:.2f}p outside bounds ({ORB_MIN}-{ORB_MAX}p)")
         return False, "", 0, 0
     
     # Calculate indicators
@@ -403,19 +400,19 @@ def check_entry_signal(candles: List[dict], sl_warning_flag: dict) -> Tuple[bool
     # Log signal check attempt (verbose)
     logger.info(f"📊 Signal check: Close={close_latest:.5f}, ORB_High={orb_high:.5f}, ORB_Low={orb_low:.5f}, EMA={ema:.5f}, ATR={atr_pips:.2f}p")
     
-    # Debug: Log live price vs ORB levels
-    logger.debug(f"  Price check | Current: {close_latest:.5f} | ORB High: {orb_high:.5f} | ORB Low: {orb_low:.5f} | Bull setup: {close_latest > orb_high} | Bear setup: {close_latest < orb_low}")
+    # Log live price vs ORB levels (INFO level for Railway visibility)
+    logger.info(f"  Price check | Current: {close_latest:.5f} | ORB High: {orb_high:.5f} | ORB Low: {orb_low:.5f} | Bull: {close_latest > orb_high} | Bear: {close_latest < orb_low}")
     
-    # Debug: Log EMA filter
-    logger.debug(f"  EMA filter | EMA50(1H): {ema:.5f} | Above EMA: {close_latest > ema} | Below EMA: {close_latest < ema}")
+    # Log EMA filter
+    logger.info(f"  EMA filter | EMA50(1H): {ema:.5f} | Above EMA: {close_latest > ema} | Below EMA: {close_latest < ema}")
     
-    # Volume filter (already checked above, but log again for clarity)
+    # Volume filter (already checked above, but log for clarity)
     vol_sma = calculate_volume_sma(candles, VOLUME_SMA_PERIOD)
     current_volume = candles[-1].get("volume", 0)
-    logger.debug(f"  Volume filter | Current vol: {current_volume} | Vol SMA(20): {vol_sma:.0f} | Vol OK (1.5x): {current_volume > vol_sma * VOLUME_FILTER_MULTIPLIER}")
+    logger.info(f"  Volume filter | Current vol: {current_volume} | Vol SMA(20): {vol_sma:.0f} | Vol OK (1.5x): {current_volume > vol_sma * VOLUME_FILTER_MULTIPLIER}")
     
-    # Debug: Log ATR/SL check
-    logger.debug(f"  ATR/SL | ATR: {atr:.5f} | SL pips: {sl_pips:.2f} | SL OK (10–40p): {SL_MIN <= sl_pips <= SL_MAX}")
+    # Log ATR/SL check
+    logger.info(f"  ATR/SL | ATR: {atr:.5f} | SL pips: {sl_pips:.2f} | SL OK (10–40p): {SL_MIN <= sl_pips <= SL_MAX}")
     
     # Entry signal: close breaks above ORB high + close > EMA
     if close_latest > (orb_high + 0.0001) and close_latest > ema:
@@ -429,7 +426,6 @@ def check_entry_signal(candles: List[dict], sl_warning_flag: dict) -> Tuple[bool
         logger.info(f"🎯 **SELL SIGNAL DETECTED** | SL: {sl_pips:.2f}p | TP: {tp_pips:.2f}p")
         return True, "SELL", sl_pips, tp_pips
     
-    logger.debug(f"⚠️ No breakout: Close above ORB? {close_latest > orb_high + 0.0001}, Close > EMA? {close_latest > ema}")
     return False, "", 0, 0
 
 def is_in_orb_window(candle: dict) -> bool:
@@ -447,13 +443,8 @@ def is_in_orb_window(candle: dict) -> bool:
                      candle_time.hour == ORB_START_HOUR and 
                      ORB_START_MIN <= candle_time.minute < ORB_END_MIN)
         
-        # Debug: Log matching candles (limit to first 5)
-        if is_in_orb:
-            logger.debug(f"  ✓ ORB candle: {candle_time} | H: {candle['mid']['h']}, L: {candle['mid']['l']}")
-        
         return is_in_orb
     except Exception as e:
-        logger.debug(f"  Error parsing candle time: {candle.get('time')} - {e}")
         return False
 
 # ===== MAIN BOT LOOP =====
