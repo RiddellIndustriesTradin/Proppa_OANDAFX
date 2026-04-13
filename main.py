@@ -19,7 +19,7 @@ import telegram
 OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "101-011-39004310-001").strip()
 OANDA_TOKEN = os.getenv("OANDA_TOKEN", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "8075862544"))
 
 # Strategy Parameters (Phase 2 v2.1 LOCKED)
@@ -104,8 +104,14 @@ def oanda_request(method: str, endpoint: str, data: dict = None) -> dict:
             raise ValueError(f"Unsupported method: {method}")
         
         if response.status_code >= 400:
-            logger.error(f"OANDA error {response.status_code}: {response.text}")
-            return {"error": response.text}
+            # Check if response is HTML (error page) instead of JSON
+            if response.headers.get("content-type", "").startswith("text/html"):
+                logger.error(f"❌ OANDA returned HTML error {response.status_code} - likely authentication/endpoint issue!")
+                logger.error(f"Response (first 500 chars): {response.text[:500]}")
+                return {"error": f"HTML error page from OANDA: {response.status_code}"}
+            else:
+                logger.error(f"OANDA error {response.status_code}: {response.text[:500]}")
+                return {"error": response.text}
         
         return response.json()
     except Exception as e:
@@ -398,6 +404,18 @@ def is_in_orb_window(candle: dict) -> bool:
 def main():
     """Main bot loop"""
     logger.info("🚀 Proppa EUR/USD ORB Bot started!")
+    
+    # Debug: Check credentials
+    if not OANDA_TOKEN:
+        logger.error("❌ CRITICAL: OANDA_TOKEN is not set! Bot cannot authenticate!")
+        send_telegram_alert("❌ **BOT STARTUP FAILED**\nOANDA_TOKEN environment variable not set!")
+        return
+    
+    token_preview = OANDA_TOKEN[:10] + "..." + OANDA_TOKEN[-10:] if len(OANDA_TOKEN) > 20 else "SHORT_TOKEN"
+    logger.info(f"✅ OANDA credentials loaded (token length: {len(OANDA_TOKEN)}, preview: {token_preview})")
+    logger.info(f"✅ OANDA Account: {OANDA_ACCOUNT_ID}")
+    logger.info(f"✅ OANDA Base URL: {OANDA_BASE_URL}")
+    
     send_telegram_alert("🚀 **BOT STARTED**\nEUR/USD Paper Trading (Phase 4)\nAccount: OANDA Practice")
     
     trade_logged_today = False
