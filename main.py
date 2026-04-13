@@ -326,10 +326,11 @@ def calculate_volume_sma(candles: List[dict], period: int = 20) -> float:
     volumes = [int(c.get("volume", 0)) for c in candles[-period:]]
     return sum(volumes) / period if volumes else 0
 
-def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
+def check_entry_signal(candles: List[dict], sl_warning_flag: dict) -> Tuple[bool, str, float, float]:
     """
     Check if entry signal is triggered
     Returns: (signal_triggered, direction, stop_loss_pips, take_profit_pips)
+    sl_warning_flag: dict with 'logged' boolean to track if SL warning was logged today
     """
     if len(candles) < 50:
         logger.debug(f"⚠️ Not enough candles: {len(candles)}/50")
@@ -382,9 +383,11 @@ def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
     atr_pips = atr * 10000
     sl_pips = atr_pips * ATR_MULTIPLIER
     
-    # Validate SL bounds
+    # Validate SL bounds — log warning only ONCE per day
     if not (SL_MIN <= sl_pips <= SL_MAX):
-        logger.debug(f"⚠️ SL {sl_pips:.2f}p outside bounds ({SL_MIN}-{SL_MAX}p)")
+        if not sl_warning_flag.get('logged', False):
+            logger.info(f"⚠️ SL {sl_pips:.2f}p outside bounds ({SL_MIN}-{SL_MAX}p) — skipping trades today")
+            sl_warning_flag['logged'] = True
         return False, "", 0, 0
     
     # Volume filter
@@ -399,6 +402,20 @@ def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
     
     # Log signal check attempt (verbose)
     logger.info(f"📊 Signal check: Close={close_latest:.5f}, ORB_High={orb_high:.5f}, ORB_Low={orb_low:.5f}, EMA={ema:.5f}, ATR={atr_pips:.2f}p")
+    
+    # Debug: Log live price vs ORB levels
+    logger.debug(f"  Price check | Current: {close_latest:.5f} | ORB High: {orb_high:.5f} | ORB Low: {orb_low:.5f} | Bull setup: {close_latest > orb_high} | Bear setup: {close_latest < orb_low}")
+    
+    # Debug: Log EMA filter
+    logger.debug(f"  EMA filter | EMA50(1H): {ema:.5f} | Above EMA: {close_latest > ema} | Below EMA: {close_latest < ema}")
+    
+    # Volume filter (already checked above, but log again for clarity)
+    vol_sma = calculate_volume_sma(candles, VOLUME_SMA_PERIOD)
+    current_volume = candles[-1].get("volume", 0)
+    logger.debug(f"  Volume filter | Current vol: {current_volume} | Vol SMA(20): {vol_sma:.0f} | Vol OK (1.5x): {current_volume > vol_sma * VOLUME_FILTER_MULTIPLIER}")
+    
+    # Debug: Log ATR/SL check
+    logger.debug(f"  ATR/SL | ATR: {atr:.5f} | SL pips: {sl_pips:.2f} | SL OK (10–40p): {SL_MIN <= sl_pips <= SL_MAX}")
     
     # Entry signal: close breaks above ORB high + close > EMA
     if close_latest > (orb_high + 0.0001) and close_latest > ema:
@@ -459,10 +476,19 @@ def main():
     
     trade_logged_today = False
     last_check_time = None
+    sl_warning_flag = {'logged': False}  # Track if SL warning was logged today
+    last_reset_day = None  # Track last day we reset warning flag
     
     while True:
         try:
             now = datetime.now(timezone.utc)
+            
+            # Reset daily flags at 07:00 GMT (start of trading day)
+            if last_reset_day is None or now.date() != last_reset_day:
+                sl_warning_flag['logged'] = False
+                trade_logged_today = False
+                last_reset_day = now.date()
+                logger.info(f"🔄 Daily reset — new trading day: {last_reset_day}")
             
             # Log hourly status
             if last_check_time is None or (now - last_check_time).seconds >= 3600:
@@ -479,7 +505,7 @@ def main():
                 continue
             
             # Check entry signal
-            signal_triggered, direction, sl_pips, tp_pips = check_entry_signal(candles)
+            signal_triggered, direction, sl_pips, tp_pips = check_entry_signal(candles, sl_warning_flag)
             
             if signal_triggered:
                 logger.info(f"✅ Entry signal: {direction} | SL: {sl_pips}p | TP: {tp_pips}p")
