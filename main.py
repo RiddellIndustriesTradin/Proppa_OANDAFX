@@ -363,13 +363,18 @@ def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
         logger.debug("⚠️ No candles in ORB window (07:00-07:30)")
         return False, "", 0, 0
     
+    # Debug: Log ORB candle count and time range
+    first_orb_time = orb_candles[0].get("time", "unknown")
+    last_orb_time = orb_candles[-1].get("time", "unknown")
+    logger.debug(f"📊 ORB candles: {len(orb_candles)} (from {first_orb_time} to {last_orb_time})")
+    
     orb_high = max([float(c["mid"]["h"]) for c in orb_candles])
     orb_low = min([float(c["mid"]["l"]) for c in orb_candles])
     orb_range = (orb_high - orb_low) * 10000  # Convert to pips
     
     # Check ORB range validity
     if not (ORB_MIN <= orb_range <= ORB_MAX):
-        logger.debug(f"⚠️ ORB range {orb_range:.2f}p outside bounds ({ORB_MIN}-{ORB_MAX}p)")
+        logger.debug(f"⚠️ ORB range {orb_range:.2f}p outside bounds ({ORB_MIN}-{ORB_MAX}p) | High: {orb_high:.5f}, Low: {orb_low:.5f}")
         return False, "", 0, 0
     
     # Calculate indicators
@@ -411,15 +416,27 @@ def check_entry_signal(candles: List[dict]) -> Tuple[bool, str, float, float]:
     return False, "", 0, 0
 
 def is_in_orb_window(candle: dict) -> bool:
-    """Check if candle is within ORB window (07:00-07:30 GMT)"""
+    """Check if candle is within ORB window (07:00-07:30 GMT TODAY)"""
     try:
         time_str = candle.get("time", "")
         candle_time = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
         
-        # Only hour 7, minutes 0-29 (ORB is 07:00-07:30)
-        return (candle_time.hour == ORB_START_HOUR and 
-                ORB_START_MIN <= candle_time.minute < ORB_END_MIN)
-    except:
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        candle_date = candle_time.date()
+        
+        # Only hour 7, minutes 0-29, AND only today's candles (not yesterday's hour 7)
+        is_in_orb = (candle_date == today and 
+                     candle_time.hour == ORB_START_HOUR and 
+                     ORB_START_MIN <= candle_time.minute < ORB_END_MIN)
+        
+        # Debug: Log matching candles (limit to first 5)
+        if is_in_orb:
+            logger.debug(f"  ✓ ORB candle: {candle_time} | H: {candle['mid']['h']}, L: {candle['mid']['l']}")
+        
+        return is_in_orb
+    except Exception as e:
+        logger.debug(f"  Error parsing candle time: {candle.get('time')} - {e}")
         return False
 
 # ===== MAIN BOT LOOP =====
