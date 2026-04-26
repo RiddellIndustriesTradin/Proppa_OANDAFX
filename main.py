@@ -2,7 +2,7 @@
 Proppa EUR/USD ORB Trading Bot
 Phase 4 Paper Trading / Phase 5 Live via OANDA v20 API
 Strategy: EUR/USD 15M ORB with 1H EMA(50) + Volume filters
-Version: 2.0 — QA Fixed (27 April 2026)
+Version: 2.1 — QA Fixed (27 April 2026)
 
 FIXES FROM v1.0:
   FIX 1: Removed 1-pip entry buffer (was suppressing valid signals)
@@ -11,6 +11,11 @@ FIXES FROM v1.0:
   FIX 4: Split TP structure — TP1 at 1:1 RR (50%), TP2 at 2:1 RR (50%)
   FIX 5: Volume filter log level raised to INFO (was DEBUG — invisible in Railway)
   FIX 6: Signal check logs fire on every bar in entry window for full visibility
+
+FIXES IN v2.1:
+  FIX 7: Candle fetch now filters to complete:true only — prevents wick/partial
+         candle entries. Spec requires 15M close break, not in-progress price.
+         Filter applied at API boundary in get_candles_15m / get_candles_1h.
 """
 
 import os
@@ -146,21 +151,35 @@ def oanda_put(endpoint: str, data: dict) -> dict:
 
 
 def get_candles_15m(count: int = 500) -> List[dict]:
-    """Fetch 15M candles — used for ORB, ATR, volume."""
+    """Fetch 15M candles — used for ORB, ATR, volume.
+    Returns ONLY closed candles (complete:true) per spec — Fix 7.
+    Spec requires 15M CLOSE break of ORB, not in-progress price.
+    """
     data = oanda_get(
         f"/v3/instruments/{INSTRUMENT}/candles",
         params={"count": min(count, 5000), "granularity": "M15", "price": "MBA"}
     )
-    return data.get("candles", [])
+    raw = data.get("candles", [])
+    closed = [c for c in raw if c.get("complete", False)]
+    if len(raw) != len(closed):
+        logger.info(f"15M fetch: {len(raw)} raw → {len(closed)} closed (dropped {len(raw)-len(closed)} in-progress)")
+    return closed
 
 
 def get_candles_1h(count: int = 60) -> List[dict]:
-    """Fetch 1H candles — used for EMA(50) per spec (FIX 2)."""
+    """Fetch 1H candles — used for EMA(50) per spec (FIX 2).
+    Returns ONLY closed candles (complete:true) — Fix 7.
+    EMA(50) of in-progress 1H bar would corrupt trend filter.
+    """
     data = oanda_get(
         f"/v3/instruments/{INSTRUMENT}/candles",
         params={"count": min(count, 5000), "granularity": "H1", "price": "M"}
     )
-    return data.get("candles", [])
+    raw = data.get("candles", [])
+    closed = [c for c in raw if c.get("complete", False)]
+    if len(raw) != len(closed):
+        logger.info(f"1H fetch: {len(raw)} raw → {len(closed)} closed (dropped {len(raw)-len(closed)} in-progress)")
+    return closed
 
 
 def get_account() -> dict:
