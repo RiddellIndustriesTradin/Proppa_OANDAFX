@@ -1,537 +1,599 @@
 """
-Proppa EUR/USD ORB Paper Trading Bot
-Phase 4 Paper Trading via OANDA Practice v20 API
-Strategy: EUR/USD 15M ORB with EMA + Volume filters
+Proppa Kraken Crypto Bot
+Production-ready Kraken Futures trading bot with TradingView webhook integration.
+Supertrend + RSI strategy with full risk management.
 """
 
 import os
-import json
+import sys
 import logging
-from datetime import datetime, timedelta, timezone
-import time
-from typing import Optional, Dict, List, Tuple
+import json
+import signal
+from datetime import datetime, timedelta
+from typing import Dict, Tuple
 
-import requests
-from requests.auth import HTTPBasicAuth
-import telegram
+from flask import Flask, request, jsonify
+import yaml
+from dotenv import load_dotenv
 
-# ===== CONFIGURATION =====
-OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "101-011-39004310-001").strip()
-OANDA_TOKEN = os.getenv("OANDA_TOKEN", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "8075862544"))
+# Import bot modules
+from signal_parser import SignalParser
+from kraken_api import KrakenAPI
+from position_sizing import PositionSizer
+from risk_manager import RiskManager
+from telegram_alerts import TelegramAlerter
+from trade_logger import TradeLogger
 
-# Strategy Parameters (Phase 2 v2.1 LOCKED)
-ORB_START_HOUR, ORB_START_MIN = 7, 0
-ORB_END_HOUR, ORB_END_MIN = 7, 30
-ENTRY_START_HOUR, ENTRY_START_MIN = 7, 30
-ENTRY_END_HOUR, ENTRY_END_MIN = 9, 0
-EOD_CLOSE_HOUR, EOD_CLOSE_MIN = 21, 0
-TIMEZONE = "GMT"
+# Load environment variables
+load_dotenv()
 
-ORB_MIN, ORB_MAX = 5, 30  # pips
-SL_MIN, SL_MAX = 10, 40   # pips
-ATR_MULTIPLIER = 1.5
-ATR_PERIOD = 14
-EMA_PERIOD = 50
-VOLUME_SMA_PERIOD = 20
-VOLUME_FILTER_MULTIPLIER = 1.5
-PAIR = "EUR_USD"
-INSTRUMENT = "EUR_USD"
-RISK_PERCENT = 0.01  # 1% risk per trade
-LOT_SIZE = 0.01  # minimum micro lot
-COMMISSION_PIPS = 1.5
+# Ensure logs directory exists before logging setup
+# Railway filesystem won't have this directory pre-created
+os.makedirs('logs', exist_ok=True)
 
-# ===== LOGGING =====
+# Configure logging
 logging.basicConfig(
-    level=logging.INFO,  # INFO level for Railway visibility
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
-        logging.FileHandler('/tmp/eur_usd_bot.log'),
-        logging.StreamHandler()
+        logging.FileHandler('logs/bot.log'),
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Suppress noisy library logging
-logging.getLogger('telegram').setLevel(logging.WARNING)
-logging.getLogger('telegram.vendor.ptb_urllib3.urllib3').setLevel(logging.WARNING)
-logging.getLogger('requests').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING)
+# Initialize Flask app
+app = Flask(__name__)
+app.config['JSON_SORT_KEYS'] = False
 
-# ===== TELEGRAM =====
-def send_telegram_alert(message: str):
-    """Send alert to Telegram (non-blocking)"""
-    try:
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-            logger.warning("Telegram not configured, skipping alert")
-            return
+
+class TradingBot:
+    """Main trading bot orchestrator."""
+    
+    def __init__(self, config_path: str = 'config.yaml'):
+        """
+        Initialize bot.
         
-        import asyncio
-        async def send_async():
-            bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode=telegram.constants.ParseMode.MARKDOWN
-            )
+        Args:
+            config_path: Path to configuration YAML
+        """
+        self.config = self._load_config(config_path)
         
-        # Run async function without event loop warnings
+        # Initialize components
+        self.kraken = KrakenAPI(
+            api_key=self.config['kraken']['api_key'],
+            api_secret=self.config['kraken']['api_secret'],
+            sandbox=self.config['kraken'].get('sandbox', False),
+        )
+        
+        self.position_sizer = PositionSizer(
+            risk_per_trade=self.config['trading']['risk_per_trade']
+        )
+        
+        self.risk_manager = RiskManager(
+            max_daily_trades=self.config['trading']['max_daily_trades'],
+            max_consecutive_losses=self.config['trading']['max_consecutive_losses'],
+            max_daily_loss=self.config['trading']['max_daily_loss'],
+            max_drawdown=self.config['trading']['max_drawdown'],
+            max_drawdown_hard_stop=self.config['trading']['max_drawdown_hard_stop'],
+        )
+        
+        self.alerter = TelegramAlerter(
+            bot_token=self.config['telegram']['bot_token'],
+            chat_id=self.config['telegram']['chat_id'],
+        )
+        
+        self.logger = TradeLogger('trades.csv')
+        self.signal_parser = SignalParser()
+        
+        # Open positions tracker
+        self.positions_state_file = "positions_state.json"
+        self.open_positions = self._load_positions()  # Load on startup
+        self.last_updated = None
+        
+        logger.info("✓ Trading Bot initialized")
+    
+    def _load_config(self, config_path: str) -> Dict:
+        """Load configuration from YAML."""
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        loop.run_until_complete(send_async())
-        logger.info(f"Telegram alert sent: {message[:50]}...")
-    except Exception as e:
-        logger.error(f"Telegram error: {e}")
-
-# ===== OANDA API HELPERS =====
-def oanda_request(method: str, endpoint: str, data: dict = None) -> dict:
-    """Make authenticated request to OANDA v20 API"""
-    headers = {
-        "Authorization": f"Bearer {OANDA_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    url = f"{OANDA_BASE_URL}{endpoint}"
-    
-    try:
-        if method == "GET":
-            response = requests.get(url, headers=headers, timeout=10)
-        elif method == "POST":
-            response = requests.post(url, headers=headers, json=data, timeout=10)
-        else:
-            raise ValueError(f"Unsupported method: {method}")
-        
-        if response.status_code >= 400:
-            # Check if response is HTML (error page) instead of JSON
-            if response.headers.get("content-type", "").startswith("text/html"):
-                logger.error(f"❌ OANDA returned HTML error {response.status_code} - likely authentication/endpoint issue!")
-                logger.error(f"Response (first 500 chars): {response.text[:500]}")
-                return {"error": f"HTML error page from OANDA: {response.status_code}"}
-            else:
-                logger.error(f"OANDA error {response.status_code}: {response.text[:500]}")
-                return {"error": response.text}
-        
-        return response.json()
-    except Exception as e:
-        logger.error(f"Request error: {e}")
-        return {"error": str(e)}
-
-def get_candles(count: int = 500, granularity: str = "M15") -> List[dict]:
-    """Fetch historical candles from OANDA"""
-    endpoint = f"/v3/accounts/{OANDA_ACCOUNT_ID}/instruments/{INSTRUMENT}/candles"
-    params = {
-        "count": min(count, 5000),
-        "granularity": granularity,
-        "price": "MBA"  # mid, bid, ask
-    }
-    
-    headers = {
-        "Authorization": f"Bearer {OANDA_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    url = f"{OANDA_BASE_URL}{endpoint}"
-    
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("candles", [])
-        else:
-            logger.error(f"Candle fetch error: {response.status_code} - {response.text}")
-            return []
-    except Exception as e:
-        logger.error(f"Candle fetch exception: {e}")
-        return []
-
-def get_account_info() -> dict:
-    """Get account details"""
-    endpoint = f"/v3/accounts/{OANDA_ACCOUNT_ID}"
-    return oanda_request("GET", endpoint)
-
-def calculate_position_size(account_balance: float, risk_percent: float, sl_pips: float) -> int:
-    """
-    Calculate position size based on 1% risk rule
-    Formula: Units = (Account Balance * Risk%) / (SL pips * 100 * Pip Value)
-    For EUR/USD: 1 pip on 0.01 lot = $0.10 AUD
-    """
-    try:
-        risk_amount = account_balance * risk_percent  # 1% of balance
-        pip_value_per_microlot = 0.10  # $0.10 per pip per 0.01 lot
-        
-        # Calculate how many micro lots needed for the risk amount
-        units_needed = risk_amount / (sl_pips * pip_value_per_microlot)
-        
-        # Convert to standard lot units (0.01 increments)
-        units = max(int(units_needed * 100) / 100, 0.01)  # Minimum 0.01
-        
-        logger.info(f"Position sizing: Balance=${account_balance:.2f} | Risk=${risk_amount:.2f} | SL={sl_pips}p | Units={units:.2f}")
-        return int(units * 100000)  # Convert to OANDA units
-    except Exception as e:
-        logger.error(f"Position sizing error: {e}")
-        return int(LOT_SIZE * 100000)  # Fallback to fixed lot
-
-def place_order(side: str, sl_pips: float, tp_pips: float) -> dict:
-    """Place market order with stop loss and take profit"""
-    endpoint = f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
-    
-    # Get current price for TP/SL calculation
-    ticker = get_ticker()
-    if not ticker:
-        logger.error("Cannot get current price for order")
-        return {"error": "No price data"}
-    
-    bid = float(ticker.get("bids", [{}])[0].get("price", 0))
-    ask = float(ticker.get("asks", [{}])[0].get("price", 0))
-    current_price = (bid + ask) / 2
-    
-    # Get account balance for position sizing
-    account_info = get_account_info()
-    account_balance = float(account_info.get("account", {}).get("balance", 1000))
-    
-    # Calculate position size based on 1% risk
-    units = calculate_position_size(account_balance, RISK_PERCENT, sl_pips)
-    
-    # Calculate TP and SL levels
-    if side == "BUY":
-        sl_level = current_price - (sl_pips / 10000)
-        tp_level = current_price + (tp_pips / 10000)
-    else:  # SELL
-        sl_level = current_price + (sl_pips / 10000)
-        tp_level = current_price - (tp_pips / 10000)
-    
-    order_data = {
-        "order": {
-            "type": "MARKET",
-            "instrument": INSTRUMENT,
-            "units": units if side == "BUY" else -units,
-            "takeProfitOnFill": {
-                "price": f"{tp_level:.5f}"
-            },
-            "stopLossOnFill": {
-                "price": f"{sl_level:.5f}"
-            },
-            "timeInForce": "FOK"
-        }
-    }
-    
-    response = oanda_request("POST", endpoint, order_data)
-    
-    if "orderFillTransaction" in response:
-        logger.info(f"Order placed: {response['orderFillTransaction']}")
-        send_telegram_alert(f"🔥 **ENTRY SIGNAL**\n{side} EUR/USD\nPrice: {current_price:.5f}\nUnits: {units/100000:.2f} lots\nSL: {sl_pips}p | TP: {tp_pips}p")
-        return response
-    else:
-        logger.error(f"Order failed: {response}")
-        send_telegram_alert(f"❌ **ORDER FAILED**\n{response.get('error', 'Unknown error')}")
-        return response
-
-def get_ticker() -> Optional[dict]:
-    """Get current bid/ask prices"""
-    endpoint = f"/v3/accounts/{OANDA_ACCOUNT_ID}/instruments/{INSTRUMENT}/candles"
-    params = {"count": 1, "granularity": "M1"}
-    
-    headers = {
-        "Authorization": f"Bearer {OANDA_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    url = f"{OANDA_BASE_URL}{endpoint}"
-    
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("candles"):
-                candle = data["candles"][-1]
-                return {
-                    "bids": [{"price": candle["bid"]["c"]}],
-                    "asks": [{"price": candle["ask"]["c"]}]
-                }
-    except Exception as e:
-        logger.error(f"Ticker fetch error: {e}")
-    
-    return None
-
-def close_all_positions():
-    """Close all open positions at EOD"""
-    endpoint = f"/v3/accounts/{OANDA_ACCOUNT_ID}/openPositions"
-    positions = oanda_request("GET", endpoint).get("positions", [])
-    
-    for position in positions:
-        if position["instrument"] == INSTRUMENT and position["long"]["units"] != "0":
-            # Close long
-            close_endpoint = f"/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{INSTRUMENT}/close"
-            close_data = {
-                "longUnits": "ALL"
-            }
-            oanda_request("PUT", close_endpoint, close_data)
-            send_telegram_alert("📊 **EOD CLOSE** - Long position closed")
-        elif position["instrument"] == INSTRUMENT and position["short"]["units"] != "0":
-            # Close short
-            close_endpoint = f"/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{INSTRUMENT}/close"
-            close_data = {
-                "shortUnits": "ALL"
-            }
-            oanda_request("PUT", close_endpoint, close_data)
-            send_telegram_alert("📊 **EOD CLOSE** - Short position closed")
-
-# ===== STRATEGY LOGIC =====
-def calculate_atr(candles: List[dict], period: int = 14) -> float:
-    """Calculate ATR (Average True Range)"""
-    if len(candles) < period:
-        return 0
-    
-    tr_values = []
-    for i in range(1, len(candles)):
-        h = float(candles[i]["mid"]["h"])
-        l = float(candles[i]["mid"]["l"])
-        c_prev = float(candles[i-1]["mid"]["c"])
-        
-        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
-        tr_values.append(tr)
-    
-    atr = sum(tr_values[-period:]) / period
-    return atr
-
-def calculate_ema(candles: List[dict], period: int = 50) -> float:
-    """Calculate EMA (Exponential Moving Average)"""
-    if len(candles) < period:
-        return 0
-    
-    closes = [float(c["mid"]["c"]) for c in candles]
-    
-    # Simple SMA for first value
-    sma = sum(closes[-period:]) / period
-    ema = sma
-    
-    # EMA calculation
-    multiplier = 2 / (period + 1)
-    for price in closes[-period:]:
-        ema = price * multiplier + ema * (1 - multiplier)
-    
-    return ema
-
-def calculate_volume_sma(candles: List[dict], period: int = 20) -> float:
-    """Calculate Volume SMA"""
-    if len(candles) < period:
-        return 0
-    
-    volumes = [int(c.get("volume", 0)) for c in candles[-period:]]
-    return sum(volumes) / period if volumes else 0
-
-def check_entry_signal(candles: List[dict], sl_warning_flag: dict) -> Tuple[bool, str, float, float]:
-    """
-    Check if entry signal is triggered
-    Returns: (signal_triggered, direction, stop_loss_pips, take_profit_pips)
-    sl_warning_flag: dict with 'logged' boolean to track if SL warning was logged today
-    """
-    if len(candles) < 50:
-        return False, "", 0, 0
-    
-    now = datetime.now(timezone.utc)
-    
-    # Check time window (07:30-09:00 GMT)
-    hour, minute = now.hour, now.minute
-    in_window = (
-        (ENTRY_START_HOUR == hour and ENTRY_START_MIN <= minute < 60) or  # 07:30-07:59
-        (ENTRY_START_HOUR < hour < ENTRY_END_HOUR) or  # 08:00-08:59
-        (ENTRY_END_HOUR == hour and 0 <= minute < ENTRY_END_MIN)  # 09:00-09:00 (just 09:00 exactly)
-    )
-    if not in_window:
-        return False, "", 0, 0
-    
-    # Get latest candles
-    latest = candles[-1]
-    prev = candles[-2]
-    
-    high_latest = float(latest["mid"]["h"])
-    low_latest = float(latest["mid"]["l"])
-    close_latest = float(latest["mid"]["c"])
-    close_prev = float(prev["mid"]["c"])
-    
-    # Calculate ORB (opening range break)
-    orb_candles = [c for c in candles if is_in_orb_window(c)]
-    if not orb_candles:
-        return False, "", 0, 0
-    
-    # Log ORB candle count and time range
-    first_orb_time = orb_candles[0].get("time", "unknown")
-    last_orb_time = orb_candles[-1].get("time", "unknown")
-    logger.info(f"📊 ORB candles: {len(orb_candles)} (from {first_orb_time} to {last_orb_time})")
-    
-    orb_high = max([float(c["mid"]["h"]) for c in orb_candles])
-    orb_low = min([float(c["mid"]["l"]) for c in orb_candles])
-    orb_range = (orb_high - orb_low) * 10000  # Convert to pips
-    
-    # Check ORB range validity
-    if not (ORB_MIN <= orb_range <= ORB_MAX):
-        logger.info(f"⚠️ ORB range {orb_range:.2f}p outside bounds ({ORB_MIN}-{ORB_MAX}p)")
-        return False, "", 0, 0
-    
-    # Calculate indicators
-    atr = calculate_atr(candles, ATR_PERIOD)
-    atr_pips = atr * 10000
-    sl_pips = atr_pips * ATR_MULTIPLIER
-    
-    # Validate SL bounds — log warning only ONCE per day
-    if not (SL_MIN <= sl_pips <= SL_MAX):
-        if not sl_warning_flag.get('logged', False):
-            logger.info(f"⚠️ SL {sl_pips:.2f}p outside bounds ({SL_MIN}-{SL_MAX}p) — skipping trades today")
-            sl_warning_flag['logged'] = True
-        return False, "", 0, 0
-    
-    # Volume filter
-    vol_sma = calculate_volume_sma(candles, VOLUME_SMA_PERIOD)
-    current_volume = candles[-1].get("volume", 0)
-    if current_volume < vol_sma * VOLUME_FILTER_MULTIPLIER:
-        logger.debug(f"⚠️ Volume {current_volume} < threshold {vol_sma * VOLUME_FILTER_MULTIPLIER:.0f}")
-        return False, "", 0, 0
-    
-    # EMA filter
-    ema = calculate_ema(candles, EMA_PERIOD)
-    
-    # Log signal check attempt (verbose)
-    logger.info(f"📊 Signal check: Close={close_latest:.5f}, ORB_High={orb_high:.5f}, ORB_Low={orb_low:.5f}, EMA={ema:.5f}, ATR={atr_pips:.2f}p")
-    
-    # Log live price vs ORB levels (INFO level for Railway visibility)
-    logger.info(f"  Price check | Current: {close_latest:.5f} | ORB High: {orb_high:.5f} | ORB Low: {orb_low:.5f} | Bull: {close_latest > orb_high} | Bear: {close_latest < orb_low}")
-    
-    # Log EMA filter
-    logger.info(f"  EMA filter | EMA50(1H): {ema:.5f} | Above EMA: {close_latest > ema} | Below EMA: {close_latest < ema}")
-    
-    # Volume filter (already checked above, but log for clarity)
-    vol_sma = calculate_volume_sma(candles, VOLUME_SMA_PERIOD)
-    current_volume = candles[-1].get("volume", 0)
-    logger.info(f"  Volume filter | Current vol: {current_volume} | Vol SMA(20): {vol_sma:.0f} | Vol OK (1.5x): {current_volume > vol_sma * VOLUME_FILTER_MULTIPLIER}")
-    
-    # Log ATR/SL check
-    logger.info(f"  ATR/SL | ATR: {atr:.5f} | SL pips: {sl_pips:.2f} | SL OK (10–40p): {SL_MIN <= sl_pips <= SL_MAX}")
-    
-    # Entry signal: close breaks above ORB high + close > EMA
-    if close_latest > (orb_high + 0.0001) and close_latest > ema:
-        tp_pips = sl_pips * 1.5  # 1.5:1 risk-reward
-        logger.info(f"🎯 **BUY SIGNAL DETECTED** | SL: {sl_pips:.2f}p | TP: {tp_pips:.2f}p")
-        return True, "BUY", sl_pips, tp_pips
-    
-    # Short signal: close breaks below ORB low + close < EMA
-    if close_latest < (orb_low - 0.0001) and close_latest < ema:
-        tp_pips = sl_pips * 1.5
-        logger.info(f"🎯 **SELL SIGNAL DETECTED** | SL: {sl_pips:.2f}p | TP: {tp_pips:.2f}p")
-        return True, "SELL", sl_pips, tp_pips
-    
-    return False, "", 0, 0
-
-def is_in_orb_window(candle: dict) -> bool:
-    """Check if candle is within ORB window (07:00-07:30 GMT TODAY)"""
-    try:
-        time_str = candle.get("time", "")
-        candle_time = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-        
-        now = datetime.now(timezone.utc)
-        today = now.date()
-        candle_date = candle_time.date()
-        
-        # Only hour 7, minutes 0-29, AND only today's candles (not yesterday's hour 7)
-        is_in_orb = (candle_date == today and 
-                     candle_time.hour == ORB_START_HOUR and 
-                     ORB_START_MIN <= candle_time.minute < ORB_END_MIN)
-        
-        return is_in_orb
-    except Exception as e:
-        return False
-
-# ===== MAIN BOT LOOP =====
-def main():
-    """Main bot loop"""
-    logger.info("🚀 Proppa EUR/USD ORB Bot started!")
-    
-    # Debug: Check credentials
-    if not OANDA_TOKEN:
-        logger.error("❌ CRITICAL: OANDA_TOKEN is not set! Bot cannot authenticate!")
-        send_telegram_alert("❌ **BOT STARTUP FAILED**\nOANDA_TOKEN environment variable not set!")
-        return
-    
-    token_preview = OANDA_TOKEN[:10] + "..." + OANDA_TOKEN[-10:] if len(OANDA_TOKEN) > 20 else "SHORT_TOKEN"
-    logger.info(f"✅ OANDA credentials loaded (token length: {len(OANDA_TOKEN)}, preview: {token_preview})")
-    logger.info(f"✅ OANDA Account: {OANDA_ACCOUNT_ID}")
-    logger.info(f"✅ OANDA Base URL: {OANDA_BASE_URL}")
-    
-    send_telegram_alert("🚀 **BOT STARTED**\nEUR/USD Paper Trading (Phase 4)\nAccount: OANDA Practice")
-    
-    trade_logged_today = False
-    last_check_time = None
-    sl_warning_flag = {'logged': False}  # Track if SL warning was logged today
-    last_reset_day = None  # Track last day we reset warning flag
-    
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
             
-            # Reset daily flags at 07:00 GMT (start of trading day)
-            if last_reset_day is None or now.date() != last_reset_day:
-                sl_warning_flag['logged'] = False
-                trade_logged_today = False
-                last_reset_day = now.date()
-                logger.info(f"🔄 Daily reset — new trading day: {last_reset_day}")
+            # Load API keys from environment
+            config['kraken']['api_key'] = os.getenv('KRAKEN_API_KEY', config['kraken'].get('api_key'))
+            config['kraken']['api_secret'] = os.getenv('KRAKEN_API_SECRET', config['kraken'].get('api_secret'))
+            config['telegram']['bot_token'] = os.getenv('TELEGRAM_BOT_TOKEN', config['telegram'].get('bot_token'))
+            config['telegram']['chat_id'] = os.getenv('TELEGRAM_CHAT_ID', config['telegram'].get('chat_id'))
             
-            # Log hourly status
-            if last_check_time is None or (now - last_check_time).seconds >= 3600:
-                account = get_account_info()
-                balance = account.get("account", {}).get("balance", "N/A")
-                logger.info(f"⏰ Hourly check - Balance: {balance}")
-                last_check_time = now
+            # Validate required fields
+            if not config['kraken']['api_key']:
+                raise ValueError("KRAKEN_API_KEY not set")
+            if not config['kraken']['api_secret']:
+                raise ValueError("KRAKEN_API_SECRET not set")
             
-            # Fetch latest candles
-            candles = get_candles(count=500, granularity="M15")
-            if not candles:
-                logger.warning("No candles received, retrying...")
-                time.sleep(60)
-                continue
-            
-            # Check entry signal
-            signal_triggered, direction, sl_pips, tp_pips = check_entry_signal(candles, sl_warning_flag)
-            
-            if signal_triggered:
-                logger.info(f"✅ Entry signal: {direction} | SL: {sl_pips}p | TP: {tp_pips}p")
-                
-                # Place order (position size calculated dynamically inside place_order)
-                order_result = place_order(direction, sl_pips, tp_pips)
-                
-                if "orderFillTransaction" in order_result:
-                    trade_logged_today = True
-                    logger.info("✅ Order filled successfully")
-                else:
-                    logger.error(f"❌ Order failed: {order_result}")
-            
-            # EOD close check
-            if now.hour == EOD_CLOSE_HOUR and now.minute >= EOD_CLOSE_MIN:
-                if trade_logged_today:
-                    close_all_positions()
-                    trade_logged_today = False
-                    send_telegram_alert("📊 **DAILY SUMMARY**\nEnd of day close executed\nCheck trades in OANDA dashboard")
-            
-            # Reset daily flag at midnight
-            if now.hour == 0 and now.minute == 0:
-                trade_logged_today = False
-            
-            # Sleep 60 seconds before next check
-            time.sleep(60)
+            logger.info(f"✓ Config loaded from {config_path}")
+            return config
         
-        except KeyboardInterrupt:
-            logger.info("🛑 Bot stopped by user")
-            send_telegram_alert("🛑 **BOT STOPPED**")
-            break
         except Exception as e:
-            logger.error(f"❌ Bot error: {e}")
-            send_telegram_alert(f"⚠️ **BOT ERROR**\n{str(e)}")
-            time.sleep(300)  # Wait 5 min before retry
+            logger.error(f"Failed to load config: {str(e)}")
+            raise
+    
+    def _save_positions(self):
+        """Persist open positions to JSON file"""
+        try:
+            with open(self.positions_state_file, 'w') as f:
+                # Convert positions dict to JSON-serializable format
+                positions_json = {}
+                for symbol, trade in self.open_positions.items():
+                    positions_json[symbol] = {
+                        'entry_price': float(trade.get('entry_price', 0)),
+                        'entry_time': str(trade.get('entry_time', '')),
+                        'symbol': trade.get('symbol', ''),
+                        'side': trade.get('side', ''),
+                        'quantity': float(trade.get('quantity', 0)),
+                        'sl': float(trade.get('sl', 0)),
+                        'tp': float(trade.get('tp', 0)),
+                        'bars_held': int(trade.get('bars_held', 0)),
+                        'sl_order_id': trade.get('sl_order_id'),
+                    }
+                json.dump(positions_json, f, indent=2)
+                logger.debug(f"Saved {len(positions_json)} open positions")
+        except Exception as e:
+            logger.error(f"Failed to save positions state: {e}")
+    
+    def _load_positions(self):
+        """Load open positions from JSON file on startup"""
+        if not os.path.exists(self.positions_state_file):
+            return {}
+        
+        try:
+            with open(self.positions_state_file, 'r') as f:
+                positions_json = json.load(f)
+                positions = {}
+                for symbol, trade_data in positions_json.items():
+                    # Parse entry_time from ISO format string back to datetime
+                    entry_time_str = trade_data.get('entry_time')
+                    try:
+                        entry_time = datetime.fromisoformat(entry_time_str) if entry_time_str else None
+                    except:
+                        entry_time = None
+                    
+                    positions[symbol] = {
+                        'entry_price': trade_data.get('entry_price'),
+                        'entry_time': entry_time,  # Now a datetime object
+                        'symbol': trade_data.get('symbol'),
+                        'side': trade_data.get('side'),
+                        'quantity': trade_data.get('quantity'),
+                        'sl': trade_data.get('sl'),
+                        'tp': trade_data.get('tp'),
+                        'bars_held': trade_data.get('bars_held', 0),
+                        'sl_order_id': trade_data.get('sl_order_id'),
+                    }
+                logger.info(f"Loaded {len(positions)} open positions from state file")
+                return positions
+        except Exception as e:
+            logger.error(f"Failed to load positions state: {e}")
+            return {}
+    
+    def _get_account_equity(self) -> float:
+        """Get current account equity."""
+        try:
+            balance = self.kraken.get_balance()
+            return balance['equity']
+        except Exception as e:
+            logger.error(f"Failed to get account equity: {str(e)}")
+            return 0
+    
+    def process_webhook(self, payload: Dict) -> Tuple[int, Dict]:
+        """
+        Process incoming TradingView webhook.
+        
+        Args:
+            payload: Webhook JSON payload
+            
+        Returns:
+            (http_status, response_dict)
+        """
+        try:
+            logger.info(f"Webhook received: {json.dumps(payload)}")
+            
+            # Parse signal
+            is_valid, signal, error_msg = self.signal_parser.parse(payload)
+            if not is_valid:
+                logger.warning(f"Invalid signal: {error_msg}")
+                return 400, {"status": "error", "message": error_msg}
+            
+            symbol = signal['symbol']
+            action = signal['action']
+            
+            # Handle entry signals
+            if action in ['LONG', 'SHORT']:
+                return self._handle_entry(signal)
+            
+            # Handle exit signals
+            elif action.startswith('CLOSE_'):
+                return self._handle_exit(symbol, action)
+            
+            else:
+                return 400, {"status": "error", "message": f"Unknown action: {action}"}
+        
+        except Exception as e:
+            logger.error(f"Webhook processing error: {str(e)}")
+            return 500, {"status": "error", "message": str(e)}
+    
+    def _handle_entry(self, signal: Dict) -> Tuple[int, Dict]:
+        """
+        Handle entry signal (LONG or SHORT).
+        
+        Returns:
+            (http_status, response_dict)
+        """
+        symbol = signal['symbol']
+        action = signal['action']
+        price = signal['price']
+        supertrend = signal['supertrend']
+        rsi = signal.get('rsi', 50)
+        
+        logger.info(f"Processing {action} entry for {symbol}")
+        
+        # Check if position already open
+        try:
+            positions = self.kraken.get_open_positions(symbol)
+            # Normalize symbol for comparison (CCXT returns ETH/USDT:USDT, bot uses ETHUSDT)
+            normalized_symbol = symbol.replace('/', '').replace(':USDT', '')
+            if any(normalized_symbol in pos_sym for pos_sym in self.open_positions.keys()):
+                msg = f"Position already open for {symbol}"
+                logger.warning(msg)
+                return 409, {"status": "conflict", "message": msg}
+        except Exception as e:
+            logger.error(f"Position check failed: {str(e)}")
+            return 500, {"status": "error", "message": str(e)}
+        
+        # Check trading allowed
+        equity = self._get_account_equity()
+        can_trade, reason = self.risk_manager.can_trade(equity)
+        if not can_trade:
+            logger.warning(f"Cannot trade: {reason}")
+            return 403, {"status": "forbidden", "message": reason}
+        
+        # Validate entry conditions
+        is_valid, msg = self.signal_parser.validate_entry_conditions(signal, price, supertrend, rsi)
+        if not is_valid:
+            logger.warning(f"Entry conditions not met: {msg}")
+            return 400, {"status": "error", "message": msg}
+        
+        # Calculate position size
+        try:
+            # SL = supertrend line
+            stop_loss = supertrend
+            
+            # Apply position sizing multiplier if drawdown active
+            multiplier = self.risk_manager.get_position_size_multiplier()
+            
+            # Calculate base position
+            pos_calc = self.position_sizer.calculate(
+                account_equity=equity,
+                entry_price=price,
+                stop_loss=stop_loss,
+            )
+            
+            quantity = pos_calc['quantity'] * multiplier
+            
+            # Calculate TP
+            tp = self.position_sizer.calculate_take_profit(price, stop_loss)
+            
+            logger.info(
+                f"Position: {quantity} @ {price}, SL: {stop_loss}, TP: {tp} "
+                f"(multiplier: {multiplier})"
+            )
+            
+        except Exception as e:
+            logger.error(f"Position sizing error: {str(e)}")
+            return 500, {"status": "error", "message": str(e)}
+        
+        # Place order
+        order_side = 'buy' if action == 'LONG' else 'sell'
+        
+        try:
+            success, order, error = self.kraken.place_market_order(
+                symbol=symbol,
+                side=order_side,
+                quantity=quantity,
+            )
+            
+            if not success:
+                logger.error(f"Order failed: {error}")
+                return 400, {"status": "error", "message": error}
+            
+            # Record in risk manager
+            self.risk_manager.record_trade_entry()
+            
+            # Store trade in memory
+            trade = {
+                "symbol": symbol,
+                "side": action,
+                "entry_price": price,
+                "sl": stop_loss,
+                "tp": tp,
+                "quantity": quantity,
+                "entry_time": datetime.utcnow(),
+                "order_id": order['order_id'],
+            }
+            
+            self.open_positions[symbol] = trade
+            
+            # Persist positions to JSON
+            self._save_positions()
+            
+            # Place exchange-level stop loss order on Kraken
+            sl_side = 'sell' if action == 'LONG' else 'buy'
+            sl_success, sl_order, sl_error = self.kraken.place_stop_loss_order(
+                symbol=symbol,
+                side=sl_side,
+                quantity=quantity,
+                stop_price=stop_loss
+            )
+            
+            if sl_success:
+                trade['sl_order_id'] = sl_order['sl_order_id']
+                self._save_positions()  # Save the SL order ID
+                logger.info(f"✓ Exchange SL placed @ {stop_loss}")
+            else:
+                logger.error(f"⚠️ Exchange SL placement failed: {sl_error}")
+                trade['sl_order_id'] = None
+                self.alerter.alert_risk_event(f"⚠️ SL Placement Failed: {sl_error}")
+                self._save_positions()
+            
+            # Send alert
+            if action == 'LONG':
+                self.alerter.alert_entry_long(trade)
+            else:
+                self.alerter.alert_entry_short(trade)
+            
+            logger.info(f"✓ Entry executed: {action} {quantity} {symbol} @ {price}")
+            
+            return 200, {
+                "status": "success",
+                "action": action,
+                "symbol": symbol,
+                "quantity": quantity,
+                "entry_price": price,
+                "sl": stop_loss,
+                "tp": tp,
+            }
+        
+        except Exception as e:
+            logger.error(f"Entry execution error: {str(e)}")
+            return 500, {"status": "error", "message": str(e)}
+    
+    def _handle_exit(self, symbol: str, action: str) -> Tuple[int, Dict]:
+        """
+        Handle exit signal (CLOSE_*).
+        
+        Returns:
+            (http_status, response_dict)
+        """
+        if symbol not in self.open_positions:
+            msg = f"No open position for {symbol}"
+            logger.warning(msg)
+            return 404, {"status": "not_found", "message": msg}
+        
+        trade = self.open_positions[symbol]
+        exit_type = action.replace('CLOSE_', '')
+        
+        logger.info(f"Processing {exit_type} exit for {symbol}")
+        
+        try:
+            # Cancel exchange SL order if it exists
+            if trade.get('sl_order_id'):
+                logger.info(f"Cancelling exchange SL order {trade['sl_order_id']}")
+                cancel_success, cancel_error = self.kraken.cancel_order(
+                    trade['sl_order_id'], symbol
+                )
+                if not cancel_success:
+                    logger.warning(f"Failed to cancel SL: {cancel_error}")
+            
+            # Close position
+            success, order, error = self.kraken.close_position(symbol)
+            
+            if not success:
+                # If Kraken already triggered the SL, position is already closed
+                if 'No open position' in error or 'already closed' in error:
+                    logger.info(f"Exchange SL already triggered for {symbol} — treating as successful exit")
+                    # Use last ticker price as exit price
+                    try:
+                        success, ticker, ticker_error = self.kraken.get_ticker(symbol)
+                        if success:
+                            exit_price = ticker.get('last', trade['entry_price'])
+                        else:
+                            exit_price = trade['entry_price']
+                    except:
+                        exit_price = trade['entry_price']
+                    order = {'close_price': exit_price}
+                    success = True
+                else:
+                    logger.error(f"Close failed: {error}")
+                    return 400, {"status": "error", "message": error}
+            
+            exit_price = order.get('close_price', 0)
+            
+            # Fallback if price is 0 or None (Kraken may not populate immediately)
+            if not exit_price or exit_price == 0:
+                try:
+                    success, ticker, error = self.kraken.get_ticker(symbol)
+                    if success:
+                        exit_price = ticker.get('last', trade['entry_price'])
+                        logger.warning(f"Exit: fill price unavailable for {symbol}, using last price: {exit_price}")
+                    else:
+                        logger.error(f"Exit: failed to get ticker: {error}, using entry price")
+                        exit_price = trade['entry_price']
+                except Exception as e:
+                    logger.error(f"Exit: failed to get fallback price: {e}, using entry price")
+                    exit_price = trade['entry_price']
+            
+            # Calculate P&L
+            pnl_calc = self.position_sizer.calculate_pnl(
+                entry_price=trade['entry_price'],
+                exit_price=exit_price,
+                quantity=trade['quantity'],
+                side=trade['side'],
+            )
+            
+            # Record exit
+            trade['exit_price'] = exit_price
+            trade['exit_type'] = exit_type
+            trade['p&l_usd'] = pnl_calc['pnl_usd']
+            trade['p&l_pct'] = pnl_calc['pnl_pct']
+            trade['bars_held'] = self._calculate_bars_held(trade)
+            
+            # Log to CSV
+            self.logger.log_trade({
+                "timestamp": datetime.utcnow().isoformat(),
+                "symbol": symbol,
+                "side": trade['side'],
+                "entry_price": trade['entry_price'],
+                "sl": trade['sl'],
+                "tp": trade['tp'],
+                "exit_type": exit_type,
+                "exit_price": exit_price,
+                "p&l_usd": pnl_calc['pnl_usd'],
+                "p&l_pct": pnl_calc['pnl_pct'],
+                "bars_held": trade.get('bars_held', 0),
+            })
+            
+            # Update risk manager
+            equity = self._get_account_equity()
+            self.risk_manager.record_trade_exit(pnl_calc['pnl_usd'], equity)
+            
+            # Send alert
+            if exit_type == 'HARDSTOP':
+                self.alerter.alert_exit_hardstop(trade)
+            elif exit_type == 'SOFTSTOP':
+                self.alerter.alert_exit_softstop(trade)
+            elif exit_type == 'TAKEPROFIT':
+                self.alerter.alert_exit_takeprofit(trade)
+            elif exit_type == 'TIMEOUT':
+                self.alerter.alert_exit_timeout(trade)
+            
+            # Remove from open positions
+            del self.open_positions[symbol]
+            
+            # Persist positions to JSON
+            self._save_positions()
+            
+            logger.info(f"✓ Exit executed: {exit_type} {symbol} @ {exit_price}, P&L: ${pnl_calc['pnl_usd']:.2f}")
+            
+            return 200, {
+                "status": "success",
+                "action": action,
+                "symbol": symbol,
+                "exit_price": exit_price,
+                "p&l_usd": pnl_calc['pnl_usd'],
+                "p&l_pct": pnl_calc['pnl_pct'],
+            }
+        
+        except Exception as e:
+            logger.error(f"Exit execution error: {str(e)}")
+            return 500, {"status": "error", "message": str(e)}
+    
+    def _calculate_bars_held(self, trade: Dict) -> int:
+        """Calculate number of 4H candles held."""
+        entry_time = trade.get('entry_time')
+        if not entry_time:
+            return 0
+        
+        duration = datetime.utcnow() - entry_time
+        bars = int(duration.total_seconds() / (4 * 3600))  # 4H bars
+        return bars
 
-if __name__ == "__main__":
-    main()
+
+# Initialize bot (global instance)
+try:
+    bot = TradingBot('config.yaml')
+except Exception as e:
+    logger.error(f"Failed to initialize bot: {str(e)}")
+    bot = None
+
+
+# Flask routes
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """TradingView webhook endpoint."""
+    if not bot:
+        return jsonify({"status": "error", "message": "Bot not initialized"}), 500
+    
+    try:
+        payload = request.get_json()
+        if not payload:
+            return jsonify({"status": "error", "message": "Invalid JSON"}), 400
+        
+        status_code, response = bot.process_webhook(payload)
+        return jsonify(response), status_code
+    
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint."""
+    if not bot:
+        return jsonify({"status": "unhealthy"}), 500
+    
+    try:
+        equity = bot._get_account_equity()
+        return jsonify({
+            "status": "healthy",
+            "equity": equity,
+            "open_positions": len(bot.open_positions),
+            "timestamp": datetime.utcnow().isoformat(),
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/status', methods=['GET'])
+def status():
+    """Bot status endpoint."""
+    if not bot:
+        return jsonify({"status": "error"}), 500
+    
+    try:
+        equity = bot._get_account_equity()
+        risk_status = bot.risk_manager.get_status()
+        trade_stats = bot.logger.get_stats()
+        
+        return jsonify({
+            "status": "ok",
+            "equity": equity,
+            "risk": risk_status,
+            "trades": trade_stats,
+            "open_positions": list(bot.open_positions.keys()),
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def signal_handler(sig, frame):
+    """Graceful shutdown on SIGINT/SIGTERM."""
+    logger.info("Shutting down gracefully...")
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    logger.info("=" * 60)
+    logger.info("Proppa Kraken Crypto Bot Starting")
+    logger.info("=" * 60)
+    
+    # Run Flask (development; use Gunicorn for production)
+    app.run(
+        host='0.0.0.0',
+        port=5000,
+        debug=False,
+        use_reloader=False,
+    )
